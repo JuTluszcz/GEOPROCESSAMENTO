@@ -1,0 +1,459 @@
+
+TODO O CODIGO DO SQL 
+JULIA TLUSZCZ
+RA 2214660
+
+A imagem final esta no arquivo sp.jpeg
+
+
+
+
+
+-- Tabela de áreas de plantio (polígonos)
+CREATE TABLE areas_plantio (
+    gid SERIAL PRIMARY KEY,
+    nome VARCHAR(100),
+    geom GEOMETRY(POLYGON, 4291)
+);
+
+drop table areas_plantio;
+
+drop table silos;
+
+-- Tabela de silos (pontos)
+CREATE TABLE silos (
+    gid SERIAL PRIMARY KEY,
+    nome VARCHAR(100),
+    geom GEOMETRY(POINT, 4291)
+);
+
+-- Inserção de 3 áreas de plantio (fictícias em Ribeirão Preto)
+INSERT INTO areas_plantio (nome, geom) VALUES
+('Talhão A', ST_GeomFromText('POLYGON((-47.840 -21.200, -47.840 -21.190, -47.830 -21.190, -47.830 -21.200, -47.840 -21.200))', 4291)),
+('Talhão B', ST_GeomFromText('POLYGON((-47.850 -21.210, -47.850 -21.200, -47.840 -21.200, -47.840 -21.210, -47.850 -21.210))', 4291)),
+('Talhão C', ST_GeomFromText('POLYGON((-47.860 -21.220, -47.860 -21.210, -47.850 -21.210, -47.850 -21.220, -47.860 -21.220))', 4291));
+
+-- Inserção de 3 silos (pontos próximos)
+INSERT INTO silos (nome, geom) VALUES
+('Silo 1', ST_SetSRID(ST_MakePoint(-47.835, -21.195), 4291)),
+('Silo 2', ST_SetSRID(ST_MakePoint(-47.845, -21.205), 4291)),
+('Silo 3', ST_SetSRID(ST_MakePoint(-47.855, -21.215), 4291));
+
+
+--
+
+SELECT * FROM tb_municipios LIMIT 6;
+
+
+SELECT DISTINCT m.municipio, m.the_geom
+FROM tb_municipios m
+JOIN areas_plantio a
+  ON ST_Intersects(a.geom, m.the_geom);
+
+----
+
+SELECT DISTINCT m.municipio AS municipio
+FROM tb_municipios m
+JOIN silos s
+  ON ST_Intersects(ST_Transform(s.geom, 4291), m.the_geom);
+
+SELECT DISTINCT m.municipio, m.the_geom
+FROM tb_municipios m
+JOIN silos s
+  ON ST_Intersects(s.geom, m.the_geom);
+------
+
+CREATE OR REPLACE VIEW view_municipios_plantio AS
+SELECT DISTINCT m.municipio, m.the_geom
+FROM tb_municipios m
+JOIN areas_plantio a
+  ON ST_Intersects(a.geom, m.the_geom);
+
+CREATE OR REPLACE VIEW view_municipios_silos AS
+SELECT DISTINCT m.municipio, m.the_geom
+FROM tb_municipios m
+JOIN silos s
+  ON ST_Intersects(s.geom, m.the_geom);
+
+--
+
+SELECT 
+  a.gid AS area_id,
+  a.nome AS area_nome,
+  s.gid AS silo_id,
+  s.nome AS silo_nome,
+  ROUND((ST_Distance(a.geom::geography, s.geom::geography) / 1000)::numeric, 2) AS distancia_km
+FROM areas_plantio a
+JOIN LATERAL (
+  SELECT gid, nome, geom
+  FROM silos
+  ORDER BY a.geom <-> geom
+  LIMIT 1
+) AS s ON TRUE;
+
+---
+
+CREATE TABLE trajetos (
+  id SERIAL PRIMARY KEY,
+  id_silo INTEGER REFERENCES silos(gid),
+  id_area INTEGER REFERENCES areas_plantio(gid),
+  trajeto geometry(LineString, 4291)
+);
+
+INSERT INTO trajetos (id_silo, id_area, trajeto)
+SELECT 
+  s.gid,
+  a.gid,
+  ST_MakeLine(s.geom, ST_Centroid(a.geom))
+FROM areas_plantio a
+JOIN LATERAL (
+  SELECT gid, geom
+  FROM silos
+  ORDER BY a.geom <-> geom
+  LIMIT 1
+) AS s ON TRUE;
+
+----
+
+CREATE OR REPLACE FUNCTION fn_centroide_area(gid_area INTEGER)
+RETURNS TABLE (longitude DOUBLE PRECISION, latitude DOUBLE PRECISION) AS
+$$
+BEGIN
+  RETURN QUERY
+  SELECT 
+    ST_X(ST_Centroid(geom)),
+    ST_Y(ST_Centroid(geom))
+  FROM areas_plantio
+  WHERE gid = gid_area;
+END;
+$$ LANGUAGE plpgsql;
+
+----
+SELECT * FROM fn_centroide_area(1);
+
+SELECT 
+  gid,
+  nome,
+  ST_Buffer(geom::geography, -20)::geometry(Polygon, 4291) AS area_reserva
+FROM areas_plantio
+WHERE gid = 1;
+
+CREATE TABLE areas_reserva (
+  id SERIAL PRIMARY KEY,
+  id_area INTEGER REFERENCES areas_plantio(gid),
+  geom geometry(Polygon, 4291)
+);
+
+INSERT INTO areas_reserva (id_area, geom)
+SELECT 
+  gid,
+  ST_Buffer(geom::geography, -20)::geometry(Polygon, 4291)
+FROM areas_plantio
+WHERE ST_Area(geom::geography) > 500; -- filtro opcional
+
+
+----------
+
+-- Buscando centroides das cidades para colocar os silos:
+WITH cidades AS (
+  SELECT municipio, ST_Centroid(the_geom) AS centroide_geom
+  FROM tb_municipios
+  WHERE municipio IN ('Ribeirão Preto', 'Campinas', 'Piracicaba')
+)
+INSERT INTO silos (nome, geom)
+SELECT
+  municipio || ' - Silo',
+  centroide_geom
+FROM cidades;
+
+INSERT INTO trajetos (id_silo, id_area, trajeto)
+SELECT 
+  s.gid,
+  a.gid,
+  ST_MakeLine(s.geom, ST_Centroid(a.geom))
+FROM areas_plantio a
+JOIN LATERAL (
+  SELECT gid, geom
+  FROM silos
+  ORDER BY a.geom <-> geom
+  LIMIT 1
+) AS s ON TRUE;
+
+
+-- Pega o ponto do silo e o centroide da área
+WITH pontos AS (
+  SELECT
+    s.gid AS silo_id,
+    ST_ClosestPoint(r.geom, s.geom) AS ponto_silo_na_rodovia,
+    ST_ClosestPoint(r.geom, ST_Centroid(a.geom)) AS ponto_area_na_rodovia,
+    a.gid AS area_id
+  FROM silos s
+  CROSS JOIN areas_plantio a
+  CROSS JOIN tb_rodovias r
+  ORDER BY s.gid, a.gid, ST_Distance(s.geom, r.geom) + ST_Distance(ST_Centroid(a.geom), r.geom)
+  LIMIT 1
+)
+-- Cria linha conectando pontos na rodovia
+SELECT silo_id, area_id, ST_MakeLine(ponto_silo_na_rodovia, ponto_area_na_rodovia) AS trajeto_rodovia
+FROM pontos;
+
+SELECT column_name
+FROM information_schema.columns
+WHERE table_name = 'tb_rodovias'
+
+--- nome correto 
+
+WITH
+  silo_area AS (
+    SELECT 
+      a.gid AS area_id,
+      a.nome AS area_nome,
+      s.gid AS silo_id,
+      s.nome AS silo_nome,
+      s.geom AS silo_geom,
+      ST_Centroid(a.geom) AS area_centroid_geom
+    FROM areas_plantio a
+    JOIN LATERAL (
+      SELECT gid, nome, geom
+      FROM silos
+      ORDER BY a.geom <-> geom
+      LIMIT 1
+    ) AS s ON TRUE
+  ),
+
+  pontos_rodovia AS (
+    SELECT
+      sa.area_id,
+      sa.area_nome,
+      sa.silo_id,
+      sa.silo_nome,
+      r.the_geom AS rodovia_geom,
+      ST_ClosestPoint(r.the_geom, sa.silo_geom) AS ponto_silo_na_rodovia,
+      ST_ClosestPoint(r.the_geom, sa.area_centroid_geom) AS ponto_area_na_rodovia
+    FROM silo_area sa
+    CROSS JOIN tb_rodovias r
+  ),
+
+  melhor_ponto AS (
+    SELECT DISTINCT ON (area_id, silo_id)
+      area_id,
+      area_nome,
+      silo_id,
+      silo_nome,
+      ponto_silo_na_rodovia,
+      ponto_area_na_rodovia
+    FROM pontos_rodovia
+    ORDER BY area_id, silo_id, 
+             ST_Distance(ponto_silo_na_rodovia, ponto_area_na_rodovia)
+  )
+
+SELECT
+  area_id,
+  area_nome,
+  silo_id,
+  silo_nome,
+  ST_MakeLine(ponto_silo_na_rodovia, ponto_area_na_rodovia) AS trajeto_rodovia
+FROM melhor_ponto;
+
+  AND column_name ILIKE '%geom%';
+
+
+DROP VIEW IF EXISTS vw_trajetos_rodovia;
+
+----view
+CREATE VIEW vw_trajetos_rodovia AS
+WITH
+  silo_area AS (
+    SELECT 
+      a.gid AS area_id,
+      a.nome AS area_nome,
+      s.gid AS silo_id,
+      s.nome AS silo_nome,
+      s.geom AS silo_geom,
+      ST_Centroid(a.geom) AS area_centroid_geom
+    FROM areas_plantio a
+    JOIN LATERAL (
+      SELECT gid, nome, geom
+      FROM silos
+      ORDER BY a.geom <-> geom
+      LIMIT 1
+    ) AS s ON TRUE
+  ),
+
+  pontos_rodovia AS (
+    SELECT
+      sa.area_id,
+      sa.area_nome,
+      sa.silo_id,
+      sa.silo_nome,
+      r.the_geom AS rodovia_geom,
+      ST_ClosestPoint(r.the_geom, sa.silo_geom) AS ponto_silo_na_rodovia,
+      ST_ClosestPoint(r.the_geom, sa.area_centroid_geom) AS ponto_area_na_rodovia
+    FROM silo_area sa
+    CROSS JOIN tb_rodovias r
+  ),
+
+  melhor_ponto AS (
+    SELECT DISTINCT ON (area_id, silo_id)
+      area_id,
+      area_nome,
+      silo_id,
+      silo_nome,
+      ponto_silo_na_rodovia,
+      ponto_area_na_rodovia
+    FROM pontos_rodovia
+    ORDER BY area_id, silo_id, 
+             ST_Distance(ponto_silo_na_rodovia, ponto_area_na_rodovia)
+  )
+
+SELECT 
+  area_id,
+  silo_id,
+  ST_AsText(ST_SetSRID(ST_MakeLine(ponto_silo_na_rodovia, ponto_area_na_rodovia), 4291)) AS wkt_trajeto
+FROM melhor_ponto;
+
+
+DROP VIEW IF EXISTS vw_trajetos_rodovia;
+
+CREATE OR REPLACE VIEW vw_trajetos_rodovia AS
+WITH
+  silo_area AS (
+    SELECT 
+      a.gid AS area_id,
+      a.nome AS area_nome,
+      s.gid AS silo_id,
+      s.nome AS silo_nome,
+      s.geom AS silo_geom,
+      ST_Centroid(a.geom) AS area_centroid_geom
+    FROM areas_plantio a
+    JOIN LATERAL (
+      SELECT gid, nome, geom
+      FROM silos
+      ORDER BY a.geom <-> geom
+      LIMIT 1
+    ) AS s ON TRUE
+  ),
+
+  pontos_rodovia AS (
+    SELECT
+      sa.area_id,
+      sa.area_nome,
+      sa.silo_id,
+      sa.silo_nome,
+      r.the_geom AS rodovia_geom,
+      ST_ClosestPoint(r.the_geom, sa.silo_geom) AS ponto_silo_na_rodovia,
+      ST_ClosestPoint(r.the_geom, sa.area_centroid_geom) AS ponto_area_na_rodovia
+    FROM silo_area sa
+    CROSS JOIN tb_rodovias r
+  ),
+
+  melhor_ponto AS (
+    SELECT DISTINCT ON (area_id, silo_id)
+      area_id,
+      area_nome,
+      silo_id,
+      silo_nome,
+      ponto_silo_na_rodovia,
+      ponto_area_na_rodovia
+    FROM pontos_rodovia
+    ORDER BY area_id, silo_id, ST_Distance(ponto_silo_na_rodovia, ponto_area_na_rodovia)
+  )
+
+SELECT 
+  area_id,
+  silo_id,
+  ST_SetSRID(ST_MakeLine(ponto_silo_na_rodovia, ponto_area_na_rodovia), 4291) AS trajeto_rodovia
+FROM melhor_ponto;
+
+
+drop table areas_reserva;
+
+-- 1. Função que retorna o ponto central em longitude e latitude (EPSG:4326)
+CREATE OR REPLACE FUNCTION get_centroide_longlat(gid_input integer)
+RETURNS TABLE(longitude double precision, latitude double precision) AS
+$$
+BEGIN
+  RETURN QUERY
+  SELECT
+    ST_X(ST_Transform(ST_Centroid(geom), 4326)) AS longitude,
+    ST_Y(ST_Transform(ST_Centroid(geom), 4326)) AS latitude
+  FROM areas_plantio
+  WHERE gid = gid_input;
+END;
+$$ LANGUAGE plpgsql;
+
+
+-- 2. Criação da tabela com área original reduzida em 20 metros (área de reserva)
+-- Aqui assumimos que as geometrias originais estão no SRID 4291 (graus)
+-- e usamos o SRID 31983 (SIRGAS 2000 / UTM zone 23S) para cálculo métrico.
+
+CREATE TABLE area_reserva AS
+SELECT
+  gid,
+  nome,
+  ST_Transform(
+    ST_Buffer(
+      ST_Transform(geom, 31983),  -- transforma para métrico
+      -20                         -- buffer negativo de 20 metros (reduz a área)
+    ),
+    4291                         -- transforma de volta para 4291 (graus)
+  ) AS geom
+FROM areas_plantio
+WHERE gid = 1;  -- aqui você pode mudar para o gid desejado
+
+
+CREATE OR REPLACE VIEW vw_areas_com_reserva AS
+SELECT
+  gid,
+  nome,
+  geom AS area_original,
+  ST_Transform(
+    ST_Buffer(
+      ST_Transform(geom, 31983), -- transforma para métrico
+      -20                        -- reduz 20m (área de reserva)
+    ),
+    4291                        -- volta para 4291 (graus)
+  ) AS area_reserva
+FROM areas_plantio;
+
+
+CREATE OR REPLACE VIEW vw_cidades_usadas AS
+SELECT DISTINCT
+  m.gid,
+  m.municipio,
+  m.the_geom
+FROM tb_municipios m
+WHERE EXISTS (
+  SELECT 1 FROM areas_plantio a
+  WHERE ST_Intersects(a.geom, m.the_geom)
+)
+OR EXISTS (
+  SELECT 1 FROM silos s
+  WHERE ST_Intersects(ST_Transform(s.geom, 4291), m.the_geom)
+);
+
+drop view vw_cidades_usadas;
+
+CREATE OR REPLACE VIEW vw_cidades_usadas_geral AS
+SELECT DISTINCT
+  m.gid,
+  m.municipio,
+  m.the_geom
+FROM tb_municipios m
+WHERE 
+  EXISTS (
+    SELECT 1 FROM areas_plantio a
+    WHERE ST_Intersects(a.geom, m.the_geom)
+  )
+  OR EXISTS (
+    SELECT 1 FROM silos s
+    WHERE ST_Intersects(ST_Transform(s.geom, 4291), m.the_geom)
+  )
+  OR EXISTS (
+    SELECT 1 
+    FROM vw_trajetos_rodovia t
+    WHERE ST_Intersects(t.trajeto_rodovia, m.the_geom)
+  );
+
+
+
